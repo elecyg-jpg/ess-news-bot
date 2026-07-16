@@ -1,0 +1,33 @@
+name: News Summary Bot
+
+on:
+  schedule:
+    # 한국 시간 기준: 아침 8시(23:00), 점심 12시(03:00), 저녁 18시(09:00)
+    # GitHub 서버는 UTC(협정세계시) 기준이므로 한국시간(KST)에서 9시간을 빼서 설정합니다.
+    - cron: '0 23,3,9 * * *'
+  workflow_dispatch: # 수동으로 실행할 수 있는 버튼 활성화
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: 저장소 코드 불러오기
+      uses: actions/checkout@v3
+
+    - name: 파이썬 환경 설정
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+
+    - name: 필요한 라이브러리 설치
+      run: |
+        pip install -r requirements.txt
+
+    - name: 파이썬 스크립트 실행
+      env:
+        TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+        CHAT_ID: ${{ secrets.CHAT_ID }}
+        GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      run: |
+        python main.py
