@@ -12,14 +12,11 @@ on:
     # 한국시간(KST) 오후 18:00 = UTC 09:00
     - cron: "0 9 * * *"
 
-  # GitHub Actions 화면에서 수동 실행 버튼 활성화
   workflow_dispatch:
 
-# 저장소 코드를 읽는 최소 권한만 부여
 permissions:
   contents: read
 
-# 이전 실행이 끝나기 전에 다음 실행이 시작되면 중복 실행 방지
 concurrency:
   group: news-summary-bot
   cancel-in-progress: false
@@ -29,8 +26,8 @@ jobs:
     name: 뉴스 수집 및 텔레그램 전송
     runs-on: ubuntu-latest
 
-    # 크롤링 또는 API 응답 지연으로 무한 실행되는 상황 방지
-    timeout-minutes: 20
+    # 최대 15개 뉴스 주제를 처리하므로 실행 여유시간 확대
+    timeout-minutes: 30
 
     steps:
       - name: 저장소 코드 불러오기
@@ -58,6 +55,16 @@ jobs:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+
+          # 중복 제거 후 최종 전송할 뉴스 주제 수
+          MAX_TOPICS: "15"
+
+          # 유사 기사 판별 전에 수집할 Google News 후보 기사 수
+          MAX_CANDIDATES: "80"
+
+          # 동일 보도 주제에서 대표 원문 확보를 시도할 최대 매체 수
+          MAX_CLUSTER_FETCH: "3"
+
           PYTHONUNBUFFERED: "1"
           TZ: Asia/Seoul
         run: |
