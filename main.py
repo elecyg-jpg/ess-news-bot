@@ -11,7 +11,7 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
 # Gemini AI 모델 설정
 genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel('gemini-2.5-flash') # 빠르고 저렴한 최신 모델
+model = genai.GenerativeModel('gemini-3.5-flash') # 빠르고 저렴한 최신 모델
 
 # 1. 구글 뉴스 RSS URL 생성 (키워드 적용)
 keywords = '("배전망 ESS" OR "배전망 에너지저장장치" OR "AI 활용 ESS" OR "VPP" OR "가상발전소" OR "재생에너지 계통연계" OR "접속대기" OR "계통혼잡" OR "출력제어" OR "동적운영한계" OR "Dynamic Operating Envelope" OR "BESS")'
