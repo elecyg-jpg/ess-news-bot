@@ -6,6 +6,7 @@ import logging
 import urllib.parse
 from dataclasses import dataclass
 from datetime import datetime
+from difflib import SequenceMatcher
 from email.utils import parsedate_to_datetime
 from typing import Any, Iterable
 from urllib.parse import urlparse
@@ -32,7 +33,19 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 # 운영 중 모델명이 바뀌면 환경변수만 변경할 수 있도록 분리
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash").strip()
 
-MAX_ARTICLES = int(os.environ.get("MAX_ARTICLES", "5"))
+# 최종 전송할 중복 제거 후 뉴스 주제 수입니다.
+# 기존 MAX_ARTICLES 환경변수가 있으면 호환을 위해 MAX_TOPICS보다 후순위로 사용합니다.
+MAX_TOPICS = int(
+    os.environ.get("MAX_TOPICS", os.environ.get("MAX_ARTICLES", "15"))
+)
+MAX_TOPICS = max(10, min(MAX_TOPICS, 15))
+
+# Google News에서 먼저 넓게 수집할 후보 기사 수입니다.
+MAX_CANDIDATES = int(os.environ.get("MAX_CANDIDATES", "80"))
+
+# 동일 주제 기사 중 원문 확보를 시도할 최대 언론사 수입니다.
+MAX_CLUSTER_FETCH = int(os.environ.get("MAX_CLUSTER_FETCH", "3"))
+
 ARTICLE_TEXT_LIMIT = int(os.environ.get("ARTICLE_TEXT_LIMIT", "12000"))
 REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT", "20"))
 
@@ -45,18 +58,22 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-KEYWORDS = (
-    '("배전망 ESS" OR "배전망 에너지저장장치" OR "AI 활용 ESS" '
-    'OR "VPP" OR "가상발전소" OR "재생에너지 계통연계" '
-    'OR "접속대기" OR "계통혼잡" OR "출력제어" '
-    'OR "동적운영한계" OR "Dynamic Operating Envelope" OR "BESS")'
-)
+# 한 개의 긴 OR 검색식만 사용하면 특정 보도자료가 검색 상단을 독점할 수 있습니다.
+# 주제를 나누어 검색한 뒤 합치고, 유사 기사 군집화로 중복을 제거합니다.
+RSS_QUERIES = [
+    '("배전망 ESS" OR "배전망 에너지저장장치" OR "AI 활용 ESS")',
+    '("BESS" OR "ESS 화재" OR "ESS 안전" OR "에너지저장장치")',
+    '("VPP" OR "가상발전소" OR "동적운영한계" OR "Dynamic Operating Envelope")',
+    '("재생에너지 계통연계" OR "계통혼잡" OR "출력제어" OR "접속대기")',
+]
 
-ENCODED_QUERY = urllib.parse.quote(KEYWORDS)
-RSS_URL = (
-    "https://news.google.com/rss/search"
-    f"?q={ENCODED_QUERY}&hl=ko&gl=KR&ceid=KR:ko"
-)
+
+def build_rss_url(query: str) -> str:
+    encoded_query = urllib.parse.quote(query)
+    return (
+        "https://news.google.com/rss/search"
+        f"?q={encoded_query}&hl=ko&gl=KR&ceid=KR:ko"
+    )
 
 
 # =============================================================================
@@ -75,6 +92,36 @@ class ArticleData:
     date_basis: str
     body: str
     rss_summary: str
+
+
+@dataclass
+class NewsCandidate:
+    entry: Any
+    rank: int
+    title: str
+    source: str
+    published_timestamp: float
+
+
+@dataclass
+class NewsCluster:
+    candidates: list[NewsCandidate]
+
+    @property
+    def sources(self) -> list[str]:
+        result: list[str] = []
+        for candidate in self.candidates:
+            if candidate.source not in result:
+                result.append(candidate.source)
+        return result
+
+    @property
+    def latest_timestamp(self) -> float:
+        return max((item.published_timestamp for item in self.candidates), default=0.0)
+
+    @property
+    def first_rank(self) -> int:
+        return min((item.rank for item in self.candidates), default=999999)
 
 
 class ArticleSummary(BaseModel):
@@ -139,6 +186,274 @@ def build_session() -> requests.Session:
         }
     )
     return session
+
+
+# =============================================================================
+# RSS 통합 수집 및 유사 기사 군집화
+# =============================================================================
+
+TITLE_SYNONYMS = (
+    (r"인공지능", " ai "),
+    (r"에이아이", " ai "),
+    (r"배터리\s*에너지\s*저장\s*장치", " bess "),
+    (r"에너지\s*저장\s*장치", " ess "),
+    (r"가상\s*발전소", " vpp "),
+    (r"dynamic\s+operating\s+envelope", " doe "),
+    (r"동적\s*운영\s*한계", " doe "),
+)
+
+TITLE_STOPWORDS = {
+    "관련", "기반", "활용", "사업", "사업자", "구축", "운영", "추진",
+    "참여", "선정", "최종", "본격", "지원", "통해", "위한", "나서",
+    "나선다", "한다", "밝혀", "발표", "업무", "협약", "체결", "개최",
+    "국내", "글로벌", "올해", "내년", "정부", "기술", "시스템",
+    "프로젝트", "솔루션", "시장", "확대", "강화", "공급", "도입",
+    "첫", "최초", "새로운", "뉴스", "단독",
+}
+
+GENERIC_AUTHOR_WORDS = {
+    "사설", "편집국", "온라인뉴스팀", "뉴스팀", "취재팀", "보도자료",
+    "관리자", "admin", "webmaster", "기자", "에디터",
+}
+
+GENERIC_EMAIL_PREFIXES = {
+    "webmaster", "admin", "master", "contact", "help", "info",
+    "service", "support", "noreply", "no-reply",
+}
+
+
+def strip_source_suffix(title: str, source: str) -> str:
+    title = normalize_whitespace(title)
+    suffix = f" - {source}"
+    if source and title.endswith(suffix):
+        return title[:-len(suffix)].strip()
+    return title
+
+
+def canonicalize_title(title: str) -> str:
+    value = normalize_whitespace(title).lower()
+
+    for pattern, replacement in TITLE_SYNONYMS:
+        value = re.sub(pattern, replacement, value, flags=re.I)
+
+    value = re.sub(r"[^0-9a-z가-힣]+", " ", value)
+    tokens = [
+        token
+        for token in value.split()
+        if len(token) >= 2 and token not in TITLE_STOPWORDS
+    ]
+    return " ".join(tokens)
+
+
+def title_token_set(title: str) -> set[str]:
+    return set(canonicalize_title(title).split())
+
+
+def titles_are_similar(left: str, right: str) -> bool:
+    left_canonical = canonicalize_title(left)
+    right_canonical = canonicalize_title(right)
+
+    if not left_canonical or not right_canonical:
+        return False
+
+    if left_canonical == right_canonical:
+        return True
+
+    left_tokens = set(left_canonical.split())
+    right_tokens = set(right_canonical.split())
+    common = left_tokens & right_tokens
+
+    if len(common) < 3:
+        return False
+
+    union = left_tokens | right_tokens
+    jaccard = len(common) / max(len(union), 1)
+    containment = len(common) / max(min(len(left_tokens), len(right_tokens)), 1)
+    sequence = SequenceMatcher(None, left_canonical, right_canonical).ratio()
+
+    # 같은 기관·지역·기술이 반복되는 보도자료형 제목을 묶되,
+    # 공통 핵심어가 2개뿐인 일반 ESS 기사까지 과도하게 합치지 않습니다.
+    return (
+        jaccard >= 0.48
+        or containment >= 0.70
+        or (sequence >= 0.74 and jaccard >= 0.36)
+    )
+
+
+def entry_timestamp(entry: Any) -> float:
+    for key in ("published", "updated"):
+        raw = entry.get(key, "")
+        if not raw:
+            continue
+        try:
+            dt = parsedate_to_datetime(raw)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=KST)
+            return dt.timestamp()
+        except Exception:
+            continue
+    return 0.0
+
+
+def collect_news_candidates() -> list[NewsCandidate]:
+    candidates: list[NewsCandidate] = []
+    seen_keys: set[str] = set()
+    temporary_rank = 0
+
+    per_query_limit = max(20, MAX_CANDIDATES // max(len(RSS_QUERIES), 1))
+
+    for query in RSS_QUERIES:
+        feed = feedparser.parse(build_rss_url(query))
+
+        if getattr(feed, "bozo", False):
+            logger.warning(
+                "RSS 파싱 경고 | query=%s | error=%s",
+                query,
+                getattr(feed, "bozo_exception", ""),
+            )
+
+        for entry in list(feed.entries[:per_query_limit]):
+            source = normalize_whitespace(
+                getattr(getattr(entry, "source", None), "title", "")
+            ) or "신문사 미상"
+            title = strip_source_suffix(entry.get("title", "제목 없음"), source)
+
+            # 동일 언론사의 동일 제목이 여러 검색식에서 다시 잡히는 경우 제거
+            dedupe_key = f"{canonicalize_title(title)}|{source.lower()}"
+            if not dedupe_key.strip("|") or dedupe_key in seen_keys:
+                continue
+
+            seen_keys.add(dedupe_key)
+            temporary_rank += 1
+            candidates.append(
+                NewsCandidate(
+                    entry=entry,
+                    rank=temporary_rank,
+                    title=title,
+                    source=source,
+                    published_timestamp=entry_timestamp(entry),
+                )
+            )
+
+    # 여러 RSS 검색식의 결과를 실제 게시시각 기준으로 다시 통합 정렬
+    candidates.sort(
+        key=lambda item: (item.published_timestamp, -item.rank),
+        reverse=True,
+    )
+
+    candidates = candidates[:MAX_CANDIDATES]
+    for rank, candidate in enumerate(candidates, start=1):
+        candidate.rank = rank
+
+    logger.info("RSS 후보 기사 %s건 수집", len(candidates))
+    return candidates
+
+
+def cluster_news_candidates(
+    candidates: list[NewsCandidate],
+) -> list[NewsCluster]:
+    if not candidates:
+        return []
+
+    parent = list(range(len(candidates)))
+
+    def find(index: int) -> int:
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    def union(left: int, right: int) -> None:
+        left_root = find(left)
+        right_root = find(right)
+        if left_root != right_root:
+            parent[right_root] = left_root
+
+    for left in range(len(candidates)):
+        for right in range(left + 1, len(candidates)):
+            if titles_are_similar(
+                candidates[left].title,
+                candidates[right].title,
+            ):
+                union(left, right)
+
+    groups: dict[int, list[NewsCandidate]] = {}
+    for index, candidate in enumerate(candidates):
+        root = find(index)
+        groups.setdefault(root, []).append(candidate)
+
+    clusters = [
+        NewsCluster(
+            candidates=sorted(
+                group,
+                key=lambda item: (
+                    item.published_timestamp,
+                    -item.rank,
+                ),
+                reverse=True,
+            )
+        )
+        for group in groups.values()
+    ]
+
+    # 최신성을 우선하고, 같은 시점이면 여러 매체가 보도한 주제를 앞에 배치
+    clusters.sort(
+        key=lambda cluster: (
+            cluster.latest_timestamp,
+            len(cluster.sources),
+            -cluster.first_rank,
+        ),
+        reverse=True,
+    )
+
+    logger.info(
+        "유사 기사 군집화 완료 | 후보=%s건 | 고유 주제=%s건",
+        len(candidates),
+        len(clusters),
+    )
+    return clusters
+
+
+def article_quality_score(article: ArticleData) -> int:
+    score = min(len(article.body or ""), ARTICLE_TEXT_LIMIT)
+    if article.author:
+        score += 800
+    if article.email:
+        score += 300
+    if article.date_basis == "기사 원문":
+        score += 500
+    if article.url and not is_google_news_url(article.url):
+        score += 1000
+    return score
+
+
+def fetch_representative_article(
+    topic_index: int,
+    cluster: NewsCluster,
+    session: requests.Session,
+) -> ArticleData:
+    fetched: list[ArticleData] = []
+
+    for candidate in cluster.candidates[:MAX_CLUSTER_FETCH]:
+        article = fetch_article_data(topic_index, candidate.entry, session)
+        fetched.append(article)
+
+        # 원문·본문·기자 정보가 충분하면 추가 매체까지 불필요하게 크롤링하지 않음
+        if (
+            not is_google_news_url(article.url)
+            and len(article.body or "") >= 700
+            and article.author
+        ):
+            break
+
+        time.sleep(0.6)
+
+    if not fetched:
+        raise RuntimeError("대표기사 원문을 확보하지 못했습니다.")
+
+    representative = max(fetched, key=article_quality_score)
+    representative.index = topic_index
+    return representative
 
 
 # =============================================================================
@@ -286,6 +601,8 @@ def clean_author(author: str) -> str:
         or "https://" in author
         or "@" in author
         or len(author) > 50
+        or author.lower() in GENERIC_AUTHOR_WORDS
+        or any(word in author.lower() for word in ("편집국", "온라인뉴스팀", "보도자료"))
     ):
         return ""
 
@@ -318,6 +635,8 @@ def normalize_date(raw_date: str) -> str:
             int(parts["minute"] or 0),
             tzinfo=KST,
         )
+        if parts["hour"] is None:
+            return dt.strftime("%Y.%m.%d")
         return dt.strftime("%Y.%m.%d %H:%M")
 
     try:
@@ -326,7 +645,11 @@ def normalize_date(raw_date: str) -> str:
             dt = dt.replace(tzinfo=KST)
         else:
             dt = dt.astimezone(KST)
-        return dt.strftime("%Y.%m.%d %H:%M")
+
+        has_time = bool(
+            re.search(r"(?:T|\s)\d{1,2}:\d{2}", raw_date)
+        )
+        return dt.strftime("%Y.%m.%d %H:%M" if has_time else "%Y.%m.%d")
     except Exception:
         return ""
 
@@ -450,7 +773,9 @@ def extract_email(soup: BeautifulSoup, page_text: str) -> str:
     for anchor in soup.select('a[href^="mailto:"]'):
         email = anchor.get("href", "").replace("mailto:", "").split("?")[0].strip()
         if re.fullmatch(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}", email):
-            return email
+            prefix = email.split("@", 1)[0].lower()
+            if prefix not in GENERIC_EMAIL_PREFIXES:
+                return email
 
     email_pattern = re.compile(
         r"(?<![\w.+-])[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}(?![\w.-])"
@@ -461,6 +786,9 @@ def extract_email(soup: BeautifulSoup, page_text: str) -> str:
         if lower.endswith((".png", ".jpg", ".jpeg", ".gif", ".webp")):
             continue
         if "example." in lower or "wixpress.com" in lower:
+            continue
+        prefix = lower.split("@", 1)[0]
+        if prefix in GENERIC_EMAIL_PREFIXES:
             continue
         return email
 
@@ -733,6 +1061,41 @@ def fetch_article_data(
 # Gemini 요약
 # =============================================================================
 
+def split_korean_sentences(text: str) -> list[str]:
+    cleaned = normalize_whitespace(text)
+    if not cleaned:
+        return []
+
+    sentences = re.split(r"(?<=[.!?다요])\s+(?=[가-힣A-Z0-9])", cleaned)
+    result: list[str] = []
+
+    for sentence in sentences:
+        sentence = normalize_whitespace(sentence)
+        if len(sentence) < 35:
+            continue
+        if sentence in result:
+            continue
+        result.append(sentence)
+
+    return result
+
+
+def build_extractive_fallback(article: ArticleData) -> ArticleSummary:
+    source_text = article.body or article.rss_summary or article.title
+    sentences = split_korean_sentences(source_text)
+
+    one_line = sentences[0] if sentences else article.title
+    details = sentences[1:3]
+
+    while len(details) < 2:
+        details.append("기사 원문에서 추가 세부사항을 확인하기 어렵습니다.")
+
+    return ArticleSummary(
+        one_line_summary=one_line[:220],
+        details=[item[:260] for item in details[:2]],
+    )
+
+
 def summarize_article(
     client: genai.Client,
     article: ArticleData,
@@ -794,16 +1157,31 @@ def summarize_article(
         )
 
     except Exception as exc:
-        logger.exception("[%s] Gemini 요약 실패: %s", article.index, exc)
+        logger.warning("[%s] Gemini 1차 요약 실패: %s", article.index, exc)
 
-        fallback = article.rss_summary or article.title
-        return ArticleSummary(
-            one_line_summary=normalize_whitespace(fallback)[:180],
-            details=[
-                "AI 요약 처리에 실패하여 RSS에서 확인된 내용만 표시합니다.",
-                "세부 내용은 기사 원문 링크에서 확인이 필요합니다.",
-            ],
-        )
+        # 일시적인 API 형식 오류나 응답 누락에 대비해 한 번 재시도합니다.
+        try:
+            time.sleep(1.5)
+            retry_response = client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=prompt,
+                config={
+                    "response_mime_type": "application/json",
+                    "response_schema": ArticleSummary,
+                    "temperature": 0.0,
+                },
+            )
+            retry_parsed = retry_response.parsed
+            if isinstance(retry_parsed, ArticleSummary):
+                return retry_parsed
+            return ArticleSummary.model_validate(retry_parsed)
+        except Exception as retry_exc:
+            logger.exception(
+                "[%s] Gemini 재시도 실패, 기사 본문 기반 추출 요약 사용: %s",
+                article.index,
+                retry_exc,
+            )
+            return build_extractive_fallback(article)
 
 
 # =============================================================================
@@ -829,60 +1207,74 @@ def format_date(article: ArticleData) -> str:
 def format_briefing_item(
     article: ArticleData,
     summary: ArticleSummary,
+    sources: list[str],
 ) -> str:
     email = article.email or "이메일 미공개"
     details = summary.details[:2]
+    source_text = " · ".join(sources)
+
+    if len(sources) > 1:
+        media_line = f"ㅇ 보도매체: {source_text} (총 {len(sources)}개 매체)\n"
+    else:
+        media_line = f"ㅇ 보도매체: {source_text}\n"
 
     return (
         f"{article.index}. [{article.title}]\n"
-        f"ㅇ {format_author(article.author)} | {email} | "
+        f"ㅇ 대표기사: {format_author(article.author)} | {email} | "
         f"{format_date(article)} | {article.source}\n"
+        f"{media_line}"
         f"ㅇ {summary.one_line_summary}\n"
         f"  - {details[0]}\n"
         f"  - {details[1]}\n"
-        f"  - 기사 원문 링크: {article.url}"
+        f"  - 대표기사 원문: {article.url}"
     )
 
 
-def split_telegram_message(text: str, max_length: int = 3900) -> list[str]:
+def split_telegram_message(text: str, max_length: int = 3800) -> list[str]:
     """
-    Telegram sendMessage 제한(4096자)을 넘지 않도록 문단 단위로 분할합니다.
+    Telegram sendMessage 제한(4096자)을 넘지 않도록 기사 단위로 분할합니다.
+    여러 메시지로 나뉘면 각 메시지 상단에 순번을 표시합니다.
     """
     if len(text) <= max_length:
         return [text]
 
-    chunks: list[str] = []
+    paragraphs = text.split("\n\n")
+    header = paragraphs[0]
+    article_blocks = paragraphs[1:]
+    raw_chunks: list[str] = []
     current = ""
 
-    for paragraph in text.split("\n\n"):
-        candidate = f"{current}\n\n{paragraph}".strip() if current else paragraph
-
-        if len(candidate) <= max_length:
+    for block in article_blocks:
+        candidate = f"{current}\n\n{block}".strip() if current else block
+        if len(candidate) <= max_length - 80:
             current = candidate
             continue
 
         if current:
-            chunks.append(current)
+            raw_chunks.append(current)
             current = ""
 
-        # 단일 문단 자체가 너무 긴 경우 줄 단위로 재분할
-        for line in paragraph.splitlines():
-            line_candidate = f"{current}\n{line}".strip() if current else line
+        if len(block) <= max_length - 80:
+            current = block
+            continue
 
-            if len(line_candidate) <= max_length:
-                current = line_candidate
+        # 예외적으로 기사 한 건이 너무 길면 줄 단위로 분할
+        for line in block.splitlines():
+            candidate = f"{current}\n{line}".strip() if current else line
+            if len(candidate) <= max_length - 80:
+                current = candidate
             else:
                 if current:
-                    chunks.append(current)
-                for start in range(0, len(line), max_length):
-                    piece = line[start:start + max_length]
-                    if len(piece) == max_length:
-                        chunks.append(piece)
-                    else:
-                        current = piece
+                    raw_chunks.append(current)
+                current = line[: max_length - 80]
 
     if current:
-        chunks.append(current)
+        raw_chunks.append(current)
+
+    total = len(raw_chunks)
+    chunks: list[str] = []
+    for index, chunk in enumerate(raw_chunks, start=1):
+        chunks.append(f"{header} ({index}/{total})\n\n{chunk}")
 
     return chunks
 
@@ -930,33 +1322,49 @@ def get_news_and_summarize() -> None:
     client = genai.Client(api_key=GEMINI_API_KEY)
 
     try:
-        feed = feedparser.parse(RSS_URL)
+        candidates = collect_news_candidates()
 
-        if getattr(feed, "bozo", False):
-            logger.warning("RSS 파싱 경고: %s", getattr(feed, "bozo_exception", ""))
-
-        entries = list(feed.entries[:MAX_ARTICLES])
-
-        if not entries:
+        if not candidates:
             send_telegram_message(
                 session,
                 "👀 현재 시간 기준으로 검색된 배전망·ESS 뉴스가 없습니다.",
             )
             return
 
+        clusters = cluster_news_candidates(candidates)
+        selected_clusters = clusters[:MAX_TOPICS]
+
         briefing_items: list[str] = []
 
-        for index, entry in enumerate(entries, start=1):
-            article = fetch_article_data(index, entry, session)
-            summary = summarize_article(client, article)
-            briefing_items.append(format_briefing_item(article, summary))
+        for topic_index, cluster in enumerate(selected_clusters, start=1):
+            representative = fetch_representative_article(
+                topic_index,
+                cluster,
+                session,
+            )
+            summary = summarize_article(client, representative)
+            briefing_items.append(
+                format_briefing_item(
+                    representative,
+                    summary,
+                    cluster.sources,
+                )
+            )
 
-            # Google News 디코딩 요청 간 과도한 호출 방지
-            if index < len(entries):
-                time.sleep(1.0)
+            logger.info(
+                "주제 %s/%s 처리 완료 | 보도매체=%s",
+                topic_index,
+                len(selected_clusters),
+                ", ".join(cluster.sources),
+            )
+
+            if topic_index < len(selected_clusters):
+                time.sleep(0.8)
 
         final_message = (
-            "⚡ [배전망/ESS 주요 뉴스 브리핑]\n\n"
+            "⚡ [배전망/ESS 주요 뉴스 브리핑]\n"
+            f"수집 {len(candidates)}건 → 중복 제거 {len(clusters)}개 주제 → "
+            f"주요 {len(selected_clusters)}개 주제 선별\n\n"
             + "\n\n".join(briefing_items)
         )
 
