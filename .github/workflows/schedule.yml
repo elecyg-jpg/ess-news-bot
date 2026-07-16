@@ -13,10 +13,10 @@ jobs:
 
     steps:
     - name: 저장소 코드 불러오기
-      uses: actions/checkout@v3
+      uses: actions/checkout@v4
 
     - name: 파이썬 환경 설정
-      uses: actions/setup-python@v4
+      uses: actions/setup-python@v5
       with:
         python-version: '3.10'
 
